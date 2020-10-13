@@ -1,2 +1,2 @@
-# GDB.jl
+# GBD.jl
 Geometric algebra Based Dynamics
