@@ -1,0 +1,10 @@
+name = "GBD"
+uuid = "5dcba5c2-8887-4bc3-b6e6-28f98c53b17b"
+authors = ["mewertd2 <mewert99@yahoo.com>"]
+version = "0.1.0"
+
+[deps]
+CoordinateTransformations = "150eb455-5306-5404-9cee-2592286d6298"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Multivectors = "7984e3fa-4652-481f-a8e5-141db0974c74"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
