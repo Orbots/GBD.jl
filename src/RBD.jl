@@ -1,29 +1,33 @@
 module RBD
 
 export 
-SolverBody, SolverConstraint3DofLinear, SolverConstraint1Dof, SolverConstraint1DofAngular,
+SolverBody, SolverConstraint3DofLinear, SolverConstraint1Dof, SolverConstraint1DofAngular, SolverConstraintRigid,
 solve, projectToManifoldVelocity, projectToR3Velocity!, 
-setupPointToPointConstraint, setup1DofConstraint, setup1DofAngularConstraint,
-skew, translation, create_transform, transform, inertia_tensor,
+setupPointToPointConstraint, setup1DofConstraint, setup1DofAngularConstraint, setupRigidConstraint,
+skew, translation, create_transform, transform, inertia_tensor, rotation,
 Matrix3x3, Vector3, Matrix4x4, Transform, step_world, RigidBody, to_solver_body, 
-RigidBodyConstraint, PointToPointConstraint, Linear1DofConstraint, ContactConstraint, Angular1DofConstraint,
-getJa, getJb, setJa!, setJb!, ndof, bodyA, bodyB, body_ids,
+RigidBodyConstraint, PointToPointConstraint, Linear1DofConstraint, ContactConstraint, Angular1DofConstraint, RigidConstraint,
+ndof, bodyA, bodyB, body_ids,
 to_solver_constraint, linearJa, linearJb, angularJa, angularJb, rhs
 
 using LinearAlgebra, StaticArrays, ReferenceFrameRotations, SparseArrays
 
 Scalar = Float64
 Vector3 = SVector{3, Scalar}
+Vector6 = SVector{6, Scalar}
 Matrix3x3 = SMatrix{3,3, Scalar, 9}
 Matrix4x4 = SMatrix{4,4, Scalar, 16}
+Matrix6x6 = SMatrix{6,6, Scalar, 36}
+Matrix3x6 = SMatrix{3,6, Scalar, 18}
+Matrix6x3 = SMatrix{6,3, Scalar, 18}
 Transform = Matrix4x4
 
-#Base.:*(A::AT, v::VT) where{T, S, AT<:SMatrix{4,4,T,16}, VT<:SVector{3,S}} = SVector{3,S}((A*vcat(v, 1))[1:3])
 transform(A::AT, v::VT) where{T, S, AT<:SMatrix{4,4,T,16}, VT<:SVector{3,S}} = SVector{3,S}((A*vcat(v, 1))[1:3])
 transform(A::AT, v::VT) where{T, S, AT<:Matrix{T}, VT<:SVector{3,S}} = SVector{3,S}((A*vcat(v, 1))[1:3])
 rotate(A::AT, v) where{T, AT<:SMatrix{4,4,T,16}} = SVector{3,T}(A[1:3,1:3]*v)
 rotate(A::AT, v) where{T, AT<:Matrix{T}} = SVector{3,T}(A[1:3,1:3]*v)
 translation(wTb) = Vector3(wTb[4,1:3])
+rotation(A::Transform) = Matrix3x3(A[1:3,1:3])
 
 create_transform(R, t) = vcat(hcat(R, zeros(3)), hcat(t', 1)) |> Transform
 
@@ -57,6 +61,9 @@ normalize(q::Quaternion) = q/norm(q)
 
 ##=========== Constraint Solver ==============##
 
+
+#== Solver types ==#
+
 mutable struct SolverBody
     v::Vector3
     ω::Vector3
@@ -72,10 +79,6 @@ end
 abstract type SolverConstraint end
 abstract type SolverConstraintClamped <: SolverConstraint end
 
-getJa(c::T) where T<:SolverConstraint = c.Ja
-getJb(c::T) where T<:SolverConstraint = c.Jb
-setJa!(c::T, Ja) where T<:SolverConstraint = (c.Ja = Ja; c)
-setJb!(c::T, Jb) where T<:SolverConstraint = (c.Jb = Jb; c)
 linearJa(c::T) where T<:SolverConstraint = zeros(3)
 linearJb(c::T) where T<:SolverConstraint = zeros(3)
 angularJa(c::T) where T<:SolverConstraint = zeros(3)
@@ -161,15 +164,42 @@ SolverConstraint3DofLinear(bodyA, bodyB) = SolverConstraint3DofLinear(
     bodyA, bodyB, 
     Matrix3x3(zeros(3,3)), Matrix3x3(zeros(3,3)), Matrix3x3(zeros(3,3)))
 
-getJa(c::SolverConstraint3DofLinear) = c.angularJa
-getJb(c::SolverConstraint3DofLinear) = c.angularJb
-setJa!(c::SolverConstraint3DofLinear, Ja) = (c.angularJa = Ja; c)
-setJb!(c::SolverConstraint3DofLinear, Jb) = (c.angularJb = Jb; c)
 ndof(c::SolverConstraint3DofLinear) = 3
 linearJa(c::T) where T<:SolverConstraint3DofLinear = Matrix3x3(diagm(ones(3)))
 linearJb(c::T) where T<:SolverConstraint3DofLinear = -Matrix3x3(diagm(ones(3)))
 angularJa(c::T) where T<:SolverConstraint3DofLinear = c.angularJa
 angularJb(c::T) where T<:SolverConstraint3DofLinear = c.angularJb
+
+mutable struct SolverConstraintRigid <: SolverConstraint
+
+    manifoldVelocityToCorrect::Vector6
+    solutionImpulse::Vector6
+
+    bodyA::SolverBody
+    bodyB::SolverBody
+
+    angularJa::Matrix3x3  # Jacobian for body A
+    angularJb::Matrix3x3  # Jacobian for body B
+
+    frame::Matrix3x3
+
+    Dinv::Matrix6x6 # effective mass inverse
+
+end
+
+SolverConstraintRigid(bodyA, bodyB) = SolverConstraintRigid(
+    Vector6(zeros(6)), Vector6(zeros(6)), 
+    bodyA, bodyB, 
+    zero(Matrix3x3), zero(Matrix3x3), zero(Matrix3x3), zero(Matrix6x6))
+
+ndof(c::SolverConstraintRigid) = 6
+linearJa(c::T) where T<:SolverConstraintRigid = Matrix6x3(vcat(diagm(ones(3)), zeros(3,3)))
+linearJb(c::T) where T<:SolverConstraintRigid = Matrix6x3(vcat(-diagm(ones(3)), zeros(3,3)))
+angularJa(c::T) where T<:SolverConstraintRigid = Matrix6x3(vcat(c.angularJa, c.frame'))
+angularJb(c::T) where T<:SolverConstraintRigid = Matrix6x3(vcat(c.angularJb, -c.frame'))
+
+#== end Solver types ==#
+
 
 function setup1DofConstraint( dt_inv, wTa::Transform, wTb::Transform, pointOnAInA::Vector3, pointOnBInB::Vector3, worldAxis::Vector3, c::SolverConstraint1Dof )
     r1 = rotate(wTa, pointOnAInA);
@@ -259,6 +289,8 @@ function projectToR3Velocity!(  c::SolverConstraint1DofAngular, dp::Scalar )
     c
 end
 
+#== Contact ==#
+
 function setupContactConstraint( dt_inv, wTa::Transform, wTb::Transform, pointOnAInA::Vector3, pointOnBInB::Vector3, worldAxis::Vector3, c::SolverConstraintContact )
     c.normal_constraint = setup1DofConstraint( dt_inv, wTa, wTb, pointOnAInA, pointOnBInB, worldAxis, c.normal_constraint )
     c
@@ -270,6 +302,8 @@ function projectToR3Velocity!( c::SolverConstraintContact, dp::Scalar )
     c.normal_constraint = projectToR3Velocity!(c.normal_constraint, dp)
     c
 end
+
+#== Point to Point ===#
 
 function projectToManifoldVelocity( c::SolverConstraint3DofLinear )
     p = c.bodyA.v;
@@ -346,6 +380,118 @@ function setupPointToPointConstraint( dt_inv, wTa::Transform, wTb::Transform, po
 
     return init(c)
 end
+
+#== 6DOF all (rigid) fixed ===#
+
+function projectToManifoldVelocity( c::SolverConstraintRigid )
+    p = c.bodyA.v;
+    p -= c.bodyB.v;
+
+    p += c.angularJa*c.bodyA.ω;
+    p += c.angularJb*c.bodyB.ω;
+
+    pω = c.frame'*c.bodyA.ω;
+    pω -= c.frame'*c.bodyB.ω;
+
+    return Vector6(p..., pω...);
+end
+
+function projectToR3Velocity!( c::SolverConstraintRigid, dj::Vector6 )
+
+    # linear dof part
+    dp = Vector3(dj[1:3])
+    dpω = Vector3(dj[4:6])
+    dv = dp * c.bodyA.massInv;
+    c.bodyA.v += dv;
+    dv = dp * c.bodyB.massInv;
+    c.bodyB.v -= dv;
+    dω = c.angularJa'*dp;
+    dω = c.bodyA.Iinv*dω;
+    c.bodyA.ω += dω;
+    dω = c.angularJb'*dp;
+    dω = c.bodyB.Iinv*dω;
+    c.bodyB.ω += dω;
+
+    # angular dof part
+    dω = c.frame*dpω;
+    dω = c.bodyA.Iinv*dω;
+    c.bodyA.ω += dω;
+    dω = -c.frame*dpω;
+    dω = c.bodyB.Iinv*dω;
+    c.bodyB.ω += dω;
+
+    c
+end
+
+projectToR3Velocity!( c::SolverConstraintRigid, dp::V ) where V<:AbstractVector = projectToR3Velocity!(c, Vector6(dp))
+
+# output Dinv and solutionImpulse->zero
+# to be more Julian should change to method returning Dinv
+function init( c::SolverConstraintRigid )
+    D11 = Matrix3x3(diagm(repeat([c.bodyA.massInv+c.bodyB.massInv], 3)))
+
+    F = c.frame;
+
+    Jat = c.angularJa'
+    JaI = c.angularJa*c.bodyA.Iinv;
+    D11 += JaI*Jat;
+
+    Jbt = c.angularJb'
+    JbI = c.angularJb*c.bodyB.Iinv;
+    D11 += JbI*Jbt;
+
+    D12 = JaI*F-JbI*F;
+
+    D21 = F'*JaI'-F'*JbI'  # inertia tensor is symmetric so (J*I)' = I*J' which goes in D21
+
+    D22 = F'*c.bodyA.Iinv*F + F'*c.bodyB.Iinv*F;
+
+    D = [hcat(D11, D12) ; 
+         hcat(D21, D22)]
+    if det(D) != 0
+        c.Dinv = Matrix6x6(inv(D));
+    end
+
+    c.solutionImpulse = zero(c.solutionImpulse);
+
+    return c;
+end
+
+
+function setupRigidConstraint( dt_inv, wTa::Transform, wTb::Transform, pointOnAInA::Vector3, pointOnBInB::Vector3, Fa::Matrix3x3, Fb::Matrix3x3, c )
+    r1 = rotate(wTa, pointOnAInA);
+    r2 = rotate(wTb, pointOnBInB);
+
+    x1 = translation(wTa) + r1;
+    x2 = translation(wTb) + r2;
+
+    r1 = -r1;
+    c.angularJa = skew(r1)
+    c.angularJb = skew(r2)
+
+    # Compute the positional constraint error (scaled by the Baumgarte coefficient 'beta')
+    positionError = (x1 - x2);
+    scaleError = dt_inv*0.2;
+    positionError = positionError*scaleError;
+
+    # angular part
+    xa, ya, za = eachcol(Fa)
+    xb, yb, zb = eachcol(Fb)
+    angularError = Vector3( ya⋅zb, za⋅xb, xa⋅yb )
+    scaleError = dt_inv*0.2;
+    angularError = angularError*scaleError;
+
+    c.manifoldVelocityToCorrect = Vector6(positionError..., angularError...);
+
+    xw = normalize(ya×zb)
+    yw = normalize(za×xw)
+    c.frame = Matrix3x3(hcat(xw, yw, xw×yw))
+
+    return init(c)
+end
+
+
+#== end Constraint type methods ==#
 
 function solve( c::SolverConstraint )
     # project velocities onto constraint manifold. i.e. this gives us the magnitude of the velocity violating the constraint conditions
@@ -497,9 +643,21 @@ struct ContactConstraint <: RigidBodyConstraint
     normal::Vector3   # contact normal in body B space
 end
 
+"""
+    rigidly constrain all degrees of freedom
+"""
+struct RigidConstraint <: RigidBodyConstraint
+    bodyA::Int64
+    bodyB::Int64
+    ra::Vector3  # offset from com to pivot in space of body A
+    rb::Vector3
+    aRb::Matrix3x3  # relative frame from b to a
+end
+
 body_ids(c::T) where T<:RigidBodyConstraint = (c.bodyA, c.bodyB)
 ndof(c::T) where T<:RigidBodyConstraint = 1
 ndof(c::T) where T<:PointToPointConstraint = 3
+ndof(c::T) where T<:RigidConstraint = 6
 
 function to_solver_body(rb::RigidBody)
     R = quat_to_dcm(rb.q)' 
@@ -533,6 +691,16 @@ function to_solver_constraint(c::ContactConstraint, solver_bodies, dt)
     setupContactConstraint( 1.0/dt, rba.wTb, rbb.wTb, c.ra, c.rb, rotate(rbb.wTb, c.normal), SolverConstraintContact(rba, rbb) )
 end
 
+function to_solver_constraint(c::RigidConstraint, solver_bodies, dt)
+    rba = solver_bodies[c.bodyA]
+    rbb = solver_bodies[c.bodyB]
+
+    # the b in wTb is for "body" not body "b". everywhere else here it's for body "b"
+    wRb_a = rotation(rba.wTb)*c.aRb
+    wRa_b = rotation(rbb.wTb)*c.aRb'
+    setupRigidConstraint( 1.0/dt, rba.wTb, rbb.wTb, c.ra, c.rb, wRb_a, wRa_b, SolverConstraintRigid(rba, rbb) )
+end
+
 #==
 end # module
 
@@ -556,12 +724,12 @@ function solve_global(constraints::Vector{T}, bodies::Vector{RigidBody}, dt) whe
 
     I = zeros(Int64, sum(map(ndof, constraints))*12)
     row = 1
-     for cᵢ in constraints
-         for dofi in 1:ndof(cᵢ)
-             I[((row-1)*12+1):(row*12)] .= row 
-             row += 1
-         end
-     end
+    for cᵢ in constraints
+        for dofi in 1:ndof(cᵢ)
+            I[((row-1)*12+1):(row*12)] .= row 
+            row += 1
+        end
+    end
 
     J = map(constraints) do cᵢ
             a,b = id2active[[body_ids(cᵢ)...]]
@@ -620,38 +788,41 @@ end
 
 end
 
-#==
 using .RBD
 using LinearAlgebra, StaticArrays, ReferenceFrameRotations
 
+#==
 dt = 0.0167
 box_radius = Vector3(0.05,0.2,0.4)
-offset = Vector3(0,0.0,0)
+#box_radius = Vector3(0.2,0.2,0.2)
+offset = Vector3(-0.2,0.0,0)
 x = offset
 rb = RigidBody(x)
-rb.q = Quaternion(1.0,0,0,0); rb.ω = [1.0,0,8]; rb.x = x; rb.v = [-2.0,0.0,0.0]
+rb.q = Quaternion(1.0,0,0,0); rb.ω = [0.0,18.0,0]; rb.x = x; rb.v = [0.0,0.0,0.0]
 rb.m = 10
 rb.I = inertia_tensor(Vector3(2*box_radius), rb.m)
 
-x2 = offset+[1.0,0,0].*(box_radius*2)
+x2 = offset+[0.0,0,0].*(box_radius*2)
 rb2 = RigidBody(x2)
-rb2.q = Quaternion(1.0,0,0,0); rb2.ω = [0.0,0,0]; rb2.x = x2; rb2.v = [2.0,0.0,0.0]
+rb2.q = Quaternion(1.0,0,0,0); rb2.ω = [0.0,4,.001]; rb2.x = x2; rb2.v = [0.0,0.0,0.0]
 rb2.m = 10
 rb2.I = inertia_tensor(Vector3(2*box_radius), rb2.m)
 
-p2p = PointToPointConstraint(1, 2, Vector3([1,1,1].*(box_radius)), Vector3([-1,1,1].*(box_radius)))
-#constraints = [p2p]
+p2p = PointToPointConstraint(1, 2, Vector3([1,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)))
+#c1 = RigidConstraint(1, 2, Vector3([0,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)), Matrix3x3(diagm(ones(3))))
+c1 = RigidConstraint(1, 2, Vector3([1,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)), Matrix3x3(diagm(ones(3))))
+constraints = [c1]
 
 #  same as point to point but broken up into 3 seperate 1dof constraints
 c1 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(1,0,0))
 c2 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(0,1,0))
 c3 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(0,0,1))
-constraints = [c1,c2,c3]
-c1 = Angular1DofConstraint(1, 2, Vector3(0,0,1), rb.q, rb2.q)
-c2 = Angular1DofConstraint(1, 2, Vector3(1,0,0), rb.q, rb2.q)
-c3 = Angular1DofConstraint(1, 2, Vector3(0,1,0), rb.q, rb2.q)
+#constraints = [c1,c2,c3]
+c1 = Angular1DofConstraint(1, 2, Vector3(1,0,0), rb.q, rb2.q)
+c2 = Angular1DofConstraint(1, 2, Vector3(0,1,0), rb.q, rb2.q)
+c3 = Angular1DofConstraint(1, 2, Vector3(0,0,1), rb.q, rb2.q)
 #c3 = ContactConstraint(1, 2, Vector3([-1,1,-1].*(box_radius)), Vector3([1,1,1].*(box_radius)), normalize(Vector3(0,0,-1)))
-constraints = vcat(constraints, [c1, c2])
+#constraints = [p2p, c1, c2, c3]
 
 plane_radius = Vector3(5,5,0.5)
 rb3 = RigidBody(Vector3(0,0,-3))
@@ -699,11 +870,11 @@ end
 bodies = [rb, rb2, rb3]
 g = 0*Vector3(0,0,-9.81)
 
-for i in 1:250
+for i in 1:200
     
     rb.v += g*dt
     rb2.v += g*dt
-    step_world(bodies, constraints, dt; use_global_solver=false)
+    step_world(bodies, constraints, dt; use_global_solver=true)
 
     # DRAW
     if drawit
@@ -762,6 +933,9 @@ function constrain_boxes( rb, rb2, id, id2, p )
     c2 = Angular1DofConstraint(id, id2, Vector3(1,0,0), rb.q, rb2.q)
     c3 = Angular1DofConstraint(id, id2, Vector3(0,1,0), rb.q, rb2.q)
     [p2p, c1, c2, c3]
+
+    #cr = RigidConstraint(id, id2, p-rb.x, p-rb2.x, Matrix3x3(diagm(ones(3))))
+    #[cr]
 end
 
 nbox = 50
@@ -770,7 +944,7 @@ drawbod = []
 constraints = Vector{RigidBodyConstraint}([])
 for i in 1:nbox
     rb, symname = add_box(Vector3(0,2*(i-1)*box_radius[2]-nbox*box_radius[2],0), box_radius, i)
-    rb.ω = Vector3(0,0,10000)
+    rb.ω = Vector3(100,0,10000)
     global bodies
     global drawbod
     global constraints
