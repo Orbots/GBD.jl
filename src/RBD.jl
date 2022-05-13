@@ -532,10 +532,11 @@ mutable struct RigidBody
     v::Vector3
     ω::Vector3   # world space
     q::Quaternion{Scalar}
+    id::Int64
 end
 
-RigidBody(x,m=1.0,inertia=ones(3)) = RigidBody(x, m, inertia, 
-                                                   zeros(3), zeros(3), Quaternion(1.0,0,0,0))
+RigidBody(x, m=1.0,inertia=ones(3)) = RigidBody(x, m, inertia, 
+                                                   zeros(3), zeros(3), Quaternion(1.0,0,0,0), -1)
 
 apply_inertia(q::Quaternion, I, v) = q>>>(I.*inv(q)>>>v)
 
@@ -578,7 +579,7 @@ function step_world(bodies, constraints, dt::Scalar; external_force = rb->zero(V
 
 
     if use_global_solver
-        solver_bodies = solve_global(constraints, bodies, dt)
+        solver_bodies = solve_global(constraints, bodies, dt) |> first
         for (i, bodᵢ) in enumerate(solver_bodies)
             bodies[i].v = bodᵢ.v
             bodies[i].ω = bodᵢ.ω
@@ -654,14 +655,14 @@ struct RigidConstraint <: RigidBodyConstraint
     aRb::Matrix3x3  # relative frame from b to a
 end
 
-body_ids(c::T) where T<:RigidBodyConstraint = (c.bodyA, c.bodyB)
+body_ids(c::T, rb::Vector{RigidBody}) where T<:RigidBodyConstraint = (rb[c.bodyA].id, rb[c.bodyB].id)
 ndof(c::T) where T<:RigidBodyConstraint = 1
 ndof(c::T) where T<:PointToPointConstraint = 3
 ndof(c::T) where T<:RigidConstraint = 6
 
 function to_solver_body(rb::RigidBody)
     R = quat_to_dcm(rb.q)' 
-    Iinv_world = R*diagm(inv.(rb.I))*R' 
+    Iinv_world = R*diagm(inv.(rb.I))*R'
 
     wTb = create_transform(Array(quat_to_dcm(rb.q)'), rb.x)
     SolverBody(rb.v, rb.ω, wTb, Iinv_world, inv(rb.m))
@@ -701,6 +702,15 @@ function to_solver_constraint(c::RigidConstraint, solver_bodies, dt)
     setupRigidConstraint( 1.0/dt, rba.wTb, rbb.wTb, c.ra, c.rb, wRb_a, wRa_b, SolverConstraintRigid(rba, rbb) )
 end
 
+
+function forcepsd(A, diagfactor=1.0e-8)
+    for i in 1:size(A)[1]
+        A[i, i+1:end] = A[i+1:end, i]
+    end
+    A = A + Diagonal(A) * diagfactor
+    A
+end
+
 #==
 end # module
 
@@ -714,10 +724,19 @@ using RBD, LinearAlgebra, SparseArrays, StaticArrays, ReferenceFrameRotations
 """
 function solve_global(constraints::Vector{T}, bodies::Vector{RigidBody}, dt) where T<:RigidBodyConstraint
 
-    rbids = (sort ∘ collect)(mapreduce(body_ids, ∪, constraints; init = Set{Int64}()))
+    rbids = (sort ∘ collect)(mapreduce(x->body_ids(x, bodies), ∪, constraints; init = Set{Int64}()))
 
-    id2active = zeros(Int64, rbids[last(rbids)])
+    id2active = zeros(Int64, last(rbids))
     id2active[rbids] = 1:length(rbids)
+
+    i2original = Vector{Int64}(undef, length(rbids));
+    for i in 1:length(rbids)
+        j = 1
+        while bodies[i].id != rbids[j]
+            j += 1
+        end
+        i2original[j] = i
+    end
 
     solver_bodies = map(to_solver_body, bodies)
     c = map(cᵢ->to_solver_constraint(cᵢ, solver_bodies, dt), constraints)
@@ -732,7 +751,7 @@ function solve_global(constraints::Vector{T}, bodies::Vector{RigidBody}, dt) whe
     end
 
     J = map(constraints) do cᵢ
-            a,b = id2active[[body_ids(cᵢ)...]]
+            a,b = id2active[[body_ids(cᵢ, bodies)...]]
             a = (a-1)*6
             b = (b-1)*6
             repeat([(+).(a, 1:6)..., (+).(b, 1:6)...], ndof(cᵢ))
@@ -758,7 +777,11 @@ function solve_global(constraints::Vector{T}, bodies::Vector{RigidBody}, dt) whe
     ∂C∂x = sparse(I, reduce(vcat, J), reduce(vcat, reduce(vcat, reduce(vcat, V))))
 
     M⁻¹ = sparse(diagm(zeros(6*length(rbids))))
-    for (i, b) in enumerate(solver_bodies[rbids])
+    if length(rbids) != length(i2original)
+        throw("failed: length(rbids) == length(i2original)")
+    end
+
+    for (i, b) in enumerate(solver_bodies[i2original])
         mi = (i-1)*6+1
         M⁻¹[mi:(mi+2),mi:(mi+2)] = diagm(repeat([b.massInv], 3))
         Ii = mi+3
@@ -777,123 +800,18 @@ function solve_global(constraints::Vector{T}, bodies::Vector{RigidBody}, dt) whe
         nd = ndof(cᵢ)
         if nd == 1
             projectToR3Velocity!(cᵢ, λ[i])
+            cᵢ.solutionImpulse += λ[i];
         else
             projectToR3Velocity!(cᵢ, λ[i:(i+nd-1)])
+            cᵢ.solutionImpulse += λ[i:(i+nd-1)];
         end
         i += nd
     end
 
-    solver_bodies
+    (solver_bodies, map(cᵢ->cᵢ.solutionImpulse, c))
 end
 
 end
-
-using .RBD
-using LinearAlgebra, StaticArrays, ReferenceFrameRotations
-
-#==
-dt = 0.0167
-box_radius = Vector3(0.05,0.2,0.4)
-#box_radius = Vector3(0.2,0.2,0.2)
-offset = Vector3(-0.2,0.0,0)
-x = offset
-rb = RigidBody(x)
-rb.q = Quaternion(1.0,0,0,0); rb.ω = [0.0,18.0,0]; rb.x = x; rb.v = [0.0,0.0,0.0]
-rb.m = 10
-rb.I = inertia_tensor(Vector3(2*box_radius), rb.m)
-
-x2 = offset+[0.0,0,0].*(box_radius*2)
-rb2 = RigidBody(x2)
-rb2.q = Quaternion(1.0,0,0,0); rb2.ω = [0.0,4,.001]; rb2.x = x2; rb2.v = [0.0,0.0,0.0]
-rb2.m = 10
-rb2.I = inertia_tensor(Vector3(2*box_radius), rb2.m)
-
-p2p = PointToPointConstraint(1, 2, Vector3([1,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)))
-#c1 = RigidConstraint(1, 2, Vector3([0,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)), Matrix3x3(diagm(ones(3))))
-c1 = RigidConstraint(1, 2, Vector3([1,0,0].*(box_radius)), Vector3([-1,0,0].*(box_radius)), Matrix3x3(diagm(ones(3))))
-constraints = [c1]
-
-#  same as point to point but broken up into 3 seperate 1dof constraints
-c1 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(1,0,0))
-c2 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(0,1,0))
-c3 = Linear1DofConstraint(1, 2, Vector3([1,-1,1].*(box_radius)), Vector3([-1,-1,1].*(box_radius)), Vector3(0,0,1))
-#constraints = [c1,c2,c3]
-c1 = Angular1DofConstraint(1, 2, Vector3(1,0,0), rb.q, rb2.q)
-c2 = Angular1DofConstraint(1, 2, Vector3(0,1,0), rb.q, rb2.q)
-c3 = Angular1DofConstraint(1, 2, Vector3(0,0,1), rb.q, rb2.q)
-#c3 = ContactConstraint(1, 2, Vector3([-1,1,-1].*(box_radius)), Vector3([1,1,1].*(box_radius)), normalize(Vector3(0,0,-1)))
-#constraints = [p2p, c1, c2, c3]
-
-plane_radius = Vector3(5,5,0.5)
-rb3 = RigidBody(Vector3(0,0,-3))
-rb3.q = normalize(Quaternion(1.0,0.2,0,0)); rb3.ω = [0.0,0,0]; rb3.v = [0.0,0.0,-0.0]
-rb3.m = 1000000
-rb3.I = inertia_tensor(Vector3(plane_radius*2), rb3.m)
-
-#==
-c1 = ContactConstraint(1, 3, Vector3([1,-1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c2 = ContactConstraint(1, 3, Vector3([-1,1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c3 = ContactConstraint(1, 3, Vector3([-1,-1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c4 = ContactConstraint(1, 3, Vector3([-1,-1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c5 = ContactConstraint(1, 3, Vector3([-1,1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c6 = ContactConstraint(1, 3, Vector3([1,-1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c7 = ContactConstraint(1, 3, Vector3([1,1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c8 = ContactConstraint(1, 3, Vector3([1,1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-constraints = vcat(constraints, [c1, c2, c3, c4, c5, c6, c7, c8])
-c1 = ContactConstraint(2, 3, Vector3([1,-1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c2 = ContactConstraint(2, 3, Vector3([-1,1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c3 = ContactConstraint(2, 3, Vector3([-1,-1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c4 = ContactConstraint(2, 3, Vector3([-1,-1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c5 = ContactConstraint(2, 3, Vector3([-1,1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c6 = ContactConstraint(2, 3, Vector3([1,-1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c7 = ContactConstraint(2, 3, Vector3([1,1,-1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-c8 = ContactConstraint(2, 3, Vector3([1,1,1].*(box_radius)), Vector3([0,0,1].*(plane_radius)), normalize(Vector3(0,0,1)))
-constraints = vcat(constraints, [c1, c2, c3, c4, c5, c6, c7, c8])
-==#
-
-drawit = true 
-# DRAW
-using MeshCat, GeometryBasics, CoordinateTransformations
-if drawit
-    vis = Visualizer(); anim = Animation()
-    setobject!(vis[:box1], Rect(-Vec(box_radius), Vec(box_radius)*2)); 
-    setobject!(vis[:box2], Rect(-Vec(box_radius), Vec(box_radius)*2));
-    setobject!(vis[:plane], Rect(-Vec(plane_radius), Vec(plane_radius)*2));
-    atframe(anim, 0) do
-        settransform!(vis[:box1], compose(Translation(rb.x...), LinearMap(quat_to_dcm(rb.q)')))
-        settransform!(vis[:box2], compose(Translation(rb2.x...), LinearMap(quat_to_dcm(rb2.q)')))
-        settransform!(vis[:plane], compose(Translation(rb3.x...), LinearMap(quat_to_dcm(rb3.q)')))
-    end
-end
-#
-
-bodies = [rb, rb2, rb3]
-g = 0*Vector3(0,0,-9.81)
-
-for i in 1:200
-    
-    rb.v += g*dt
-    rb2.v += g*dt
-    step_world(bodies, constraints, dt; use_global_solver=true)
-
-    # DRAW
-    if drawit
-        atframe(anim, i) do
-            settransform!(vis[:box1], compose(Translation(rb.x...), LinearMap(quat_to_dcm(rb.q)')))
-            settransform!(vis[:box2], compose(Translation(rb2.x...), LinearMap(quat_to_dcm(rb2.q)')))
-            settransform!(vis[:plane], compose(Translation(rb3.x...), LinearMap(quat_to_dcm(rb3.q)')))
-        end
-    end
-end
-
-
-# DRAW
-if drawit
-    setanimation!(vis, anim)
-end
-
-sleep(3)
-==#
 
 #==
 using .RBD
@@ -916,6 +834,7 @@ function add_box( offset, box_radius, id)
     rb.q = Quaternion(1.0,0,0,0); rb.ω = [0.0,0,0]; rb.x = x; rb.v = [0.0,0.0,0.0]
     rb.m = 10
     rb.I = inertia_tensor(Vector3(2*box_radius), rb.m)
+    rb.id = id
     symname = Symbol("box", id)
     global drawit
     if drawit
@@ -928,14 +847,14 @@ function add_box( offset, box_radius, id)
 end
 
 function constrain_boxes( rb, rb2, id, id2, p )
-    p2p = PointToPointConstraint(id, id2, p-rb.x, p-rb2.x)
-    c1 = Angular1DofConstraint(id, id2, Vector3(0,0,1), rb.q, rb2.q)
-    c2 = Angular1DofConstraint(id, id2, Vector3(1,0,0), rb.q, rb2.q)
-    c3 = Angular1DofConstraint(id, id2, Vector3(0,1,0), rb.q, rb2.q)
-    [p2p, c1, c2, c3]
+    #p2p = PointToPointConstraint(id, id2, p-rb.x, p-rb2.x)
+    #c1 = Angular1DofConstraint(id, id2, Vector3(0,0,1), rb.q, rb2.q)
+    #c2 = Angular1DofConstraint(id, id2, Vector3(1,0,0), rb.q, rb2.q)
+    #c3 = Angular1DofConstraint(id, id2, Vector3(0,1,0), rb.q, rb2.q)
+    #[p2p, c1, c2, c3]
 
-    #cr = RigidConstraint(id, id2, p-rb.x, p-rb2.x, Matrix3x3(diagm(ones(3))))
-    #[cr]
+    cr = RigidConstraint(id, id2, p-rb.x, p-rb2.x, Matrix3x3(diagm(ones(3))))
+    [cr]
 end
 
 nbox = 50
@@ -944,13 +863,12 @@ drawbod = []
 constraints = Vector{RigidBodyConstraint}([])
 for i in 1:nbox
     rb, symname = add_box(Vector3(0,2*(i-1)*box_radius[2]-nbox*box_radius[2],0), box_radius, i)
-    rb.ω = Vector3(100,0,10000)
+    rb.ω = Vector3(0,0,1000)
     global bodies
     global drawbod
     global constraints
     bodies = vcat(bodies, [rb])
     drawbod = vcat(drawbod, (symname, box_radius, rb))
-
 
     if i > 1
         constraints = vcat(constraints, constrain_boxes(bodies[i-1], rb, i-1, i, rb.x+Vector3(0,box_radius[2],0)))
@@ -975,4 +893,9 @@ if drawit
 end
 
 sleep(3)  # seems to need a bit of time to connect to renderer
+==#
+
+#==
+
+
 ==#
