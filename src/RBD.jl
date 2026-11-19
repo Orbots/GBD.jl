@@ -814,13 +814,11 @@ function setupContactManifoldConstraint(dt_inv, points::Vector{ManifoldContact},
         onedof = setupContactConstraint(dt_inv, wTa, wTb, p.ra, p.rb, separating_axis, SolverConstraintContact(c.bodyA, c.bodyB))
         manvel = projectToManifoldVelocity(onedof)  + 9.81/dt_inv  #!me
 
-        # add some bounce. project extra velocity to make constraint react stronger 
-        #!me restitution is a bit tricky, probably need to rethink how to do it.  if weird stuff happens with contacts this is likely culprit 
-        if onedof.normal_constraint.manifoldVelocityToCorrect < 0 && manvel < 0
-            onedof.normal_constraint.manifoldVelocityToCorrect = min(onedof.normal_constraint.manifoldVelocityToCorrect, manvel*restitution)
-        else
-            onedof.normal_constraint.manifoldVelocityToCorrect -= manvel*restitution
+        bias = onedof.normal_constraint.manifoldVelocityToCorrect
+        if restitution > 0 && manvel < 0 && bias + manvel < 0
+            onedof.normal_constraint.manifoldVelocityToCorrect = min(bias, manvel*restitution)
         end
+        
         onedof
         #SolverConstraintContactManifoldPoint(0, 0, onedof.Ja, onedof.Jb, onedof.Dinv)
     end
