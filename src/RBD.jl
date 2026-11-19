@@ -771,6 +771,9 @@ function init(c::SolverConstraintContactManifold)
     Dinv += c.angularJa*c.bodyA.Iinv*c.angularJa'
     Dinv += c.angularJb*c.bodyB.Iinv*c.angularJb'
 
+    if abs(Dinv[3,3]) <= eps()
+        Dinv[3,3] = 1.0
+    end
     c.Dinv = inv(Dinv)
 
     c.solutionImpulse = zero(c.solutionImpulse)
