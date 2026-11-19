@@ -917,12 +917,15 @@ function solve(c::SolverConstraintContactManifold)
 
     # clamp
     friction_force = norm(solutionImpulse′)
-    println(friction_force, " ff > nf ", c.normalImpulse*c.mu)
+    nu = c.normalImpulse*c.mu
+    println(friction_force, " ff > nf ", nu)
 
-    if( friction_force > c.normalImpulse*c.mu )
-        clamper = (c.normalImpulse*c.mu)/(friction_force + eps())
-        solutionImpulse′ = solutionImpulse′*clamper
+    linearFriction = solutionImpulse′[1:2]
+    if( norm(linearFriction) > nu )
+        linearFriction = linearFriction*(nu/norm(linearFriction) + eps())
     end
+    solutionImpulse′ = Vector3(linearFriction..., clamp(solutionImpulse′[3], -nu, nu))
+    
 
 #==
     manImpulseDelta = manImpulse - m_solutionImpulse;
