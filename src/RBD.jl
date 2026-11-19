@@ -1861,7 +1861,7 @@ end
 
 if drawit
     vis = Visualizer()
-    anim = Animation()
+    anim = Animation(vis)
 end
 
 ground_id = 1
