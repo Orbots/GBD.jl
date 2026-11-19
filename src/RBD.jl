@@ -749,7 +749,7 @@ end
 #== contact manifold ==#
 
 function projectToManifoldVelocity(c::SolverConstraintContactManifold)
-    p = c.linearJa*c.bodyA.v - c.linearJb*c.bodyB.v
+    p = c.linearJa*c.bodyA.v + c.linearJb*c.bodyB.v
     p += c.angularJa*c.bodyA.ω + c.angularJb*c.bodyB.ω
 
     return p
@@ -757,7 +757,7 @@ end
 
 function projectToR3Velocity!(c::SolverConstraintContactManifold, dp::Vector3)
     c.bodyA.v += c.linearJa' * dp * c.bodyA.massInv
-    c.bodyB.v -= c.linearJb' * dp * c.bodyB.massInv
+    c.bodyB.v += c.linearJb' * dp * c.bodyB.massInv
     c.bodyA.ω += c.bodyA.Iinv * c.angularJa' * dp
     c.bodyB.ω += c.bodyB.Iinv * c.angularJb' * dp
     return c
@@ -797,12 +797,12 @@ function setupContactManifoldConstraint(dt_inv, points::Vector{ManifoldContact},
 
     frictionx, frictiony, _ = generate_frame(twistAxis)
 
-    c.linearJa = [frictionx frictiony zeros(3)];
+    c.linearJa = [frictionx frictiony Vector3(zeros(3))]'
 
     c.linearJb = -c.linearJa;
 
     c.angularJa = [rra×frictionx rra×frictiony twistAxis*twistMoment]
-    c.angularJb = [rrb×frictionx rrb×frictiony -twistAxis*twistMoment];
+    c.angularJb = [-rrb×frictionx -rrb×frictiony -twistAxis*twistMoment]
 
     c.mu = mu;
 
