@@ -772,7 +772,7 @@ function init(c::SolverConstraintContactManifold)
     Dinv += c.angularJb*c.bodyB.Iinv*c.angularJb'
 
     if abs(Dinv[3,3]) <= eps()
-        Dinv[3,3] = 1.0
+        Dinv = setindex(Dinv, 1.0, 3, 3)
     end
     c.Dinv = inv(Dinv)
 
